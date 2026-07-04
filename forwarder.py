@@ -1,6 +1,6 @@
 # ============================================
-#  📡 Telegram Card Forwarder - Main Script
-#  + SQLite Database + Auto Export
+#  📡 Telegram Card Forwarder
+#  + Auto Export to Channel
 # ============================================
 
 import asyncio
@@ -12,22 +12,38 @@ from datetime import datetime
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel
 
-from config import (
-    API_ID, API_HASH, PHONE_NUMBER,
-    SOURCE_CHANNELS, MY_CHANNEL,
-    DELAY_BETWEEN_POSTS,
-    VALIDATE_CARD, REMOVE_DUPLICATES,
-    SAVE_SENT_HISTORY,
-    OUTPUT_SEPARATOR, YEAR_DIGITS
-)
-from cleaner import clean_text, has_card_info
+# ============================================
+#  Environment Variables ကနေယူ
+# ============================================
+API_ID = int(os.getenv("API_ID", "36597864"))
+API_HASH = os.getenv("API_HASH", "your_hash")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER", "+959664282332")
+SOURCE_CHANNELS_STR = os.getenv("SOURCE_CHANNELS", "-1001218056496,-1001451060271,-1003776351370")
+MY_CHANNEL = int(os.getenv("MY_CHANNEL", "-1003954900164"))
 
+# Parse source channels
+SOURCE_CHANNELS = []
+for ch in SOURCE_CHANNELS_STR.split(','):
+    try:
+        SOURCE_CHANNELS.append(int(ch.strip()))
+    except:
+        SOURCE_CHANNELS.append(ch.strip())
+
+DELAY_BETWEEN_POSTS = int(os.getenv("DELAY_BETWEEN_POSTS", "3"))
+VALIDATE_CARD = os.getenv("VALIDATE_CARD", "False") == "True"
+REMOVE_DUPLICATES = os.getenv("REMOVE_DUPLICATES", "True") == "True"
+SAVE_SENT_HISTORY = os.getenv("SAVE_SENT_HISTORY", "True") == "True"
+OUTPUT_SEPARATOR = os.getenv("OUTPUT_SEPARATOR", "|")
+YEAR_DIGITS = int(os.getenv("YEAR_DIGITS", "2"))
+EXPORT_LIMIT = int(os.getenv("EXPORT_LIMIT", "5000"))
+
+from cleaner import clean_text, has_card_info
 
 # ============================================
 #  Client Setup
 # ============================================
 client = TelegramClient(
-    session="card_forwarder_session",
+    session="/tmp/card_forwarder_session",
     api_id=API_ID,
     api_hash=API_HASH
 )
@@ -41,19 +57,16 @@ CLEAN_CONFIG = {
 source_entities = {}
 sent_history = set()
 
-# ============================================
-#  Database အဆင့်တွေ
-# ============================================
-DB_FILE = "cards.db"
-HISTORY_FILE = "sent_history.json"
-EXPORT_FILE = "cards_export.txt"
-EXPORT_LIMIT = 5000  # 5000 ခုပြည့်တိုင်း export
+DB_FILE = "/tmp/cards.db"
+HISTORY_FILE = "/tmp/sent_history.json"
+EXPORT_DIR = "/tmp"
 
+# ============================================
+#  Database Functions
+# ============================================
 def init_database():
-    """Database ဖန်တီးတယ်"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,33 +76,27 @@ def init_database():
             cvv TEXT,
             source_group TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'active'
+            status TEXT DEFAULT 'active',
+            exported INTEGER DEFAULT 0
         )
     ''')
-    
     conn.commit()
     conn.close()
     print(f"✅ Database initialized: {DB_FILE}")
 
 
 def insert_card(card_number: str, month: str, year: str, cvv: str, source: str):
-    """Card ကို database ထဲထည့်"""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        formatted = f"{card_number}|{month}|{year}|{cvv}"
-        
         cursor.execute('''
             INSERT INTO cards (card_number, month, year, cvv, source_group)
             VALUES (?, ?, ?, ?, ?)
         ''', (card_number, month, year, cvv, source))
-        
         conn.commit()
         conn.close()
         return True
     except sqlite3.IntegrityError:
-        # Duplicate card
         return False
     except Exception as e:
         print(f"❌ DB insert error: {e}")
@@ -97,7 +104,6 @@ def insert_card(card_number: str, month: str, year: str, cvv: str, source: str):
 
 
 def get_card_count() -> int:
-    """Database ထဲမှာ card ဘယ်နှစ်ခုရှိလဲ"""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -109,38 +115,61 @@ def get_card_count() -> int:
         return 0
 
 
-def export_cards_to_txt(limit: int = 5000, offset: int = 0):
-    """Database ကနေ txt export လုပ်တယ်"""
+def get_unexported_count() -> int:
+    """Export မလုပ်သေးတဲ့ cards ဘယ်နှစ်ခုရှိလဲ"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM cards WHERE exported = 0")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    except:
+        return 0
+
+
+def export_cards_to_txt() -> str:
+    """Export လုပ်ပြီးသား cards ကို txt ထုတ်တယ်"""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
+        # Export မလုပ်သေးတဲ့ cards
         cursor.execute('''
-            SELECT card_number, month, year, cvv FROM cards
-            WHERE status = 'active'
+            SELECT id, card_number, month, year, cvv FROM cards
+            WHERE exported = 0
             ORDER BY id DESC
-            LIMIT ? OFFSET ?
-        ''', (limit, offset))
+            LIMIT ?
+        ''', (EXPORT_LIMIT,))
         
         rows = cursor.fetchall()
         conn.close()
         
         if not rows:
-            print("❌ No cards to export")
             return None
         
-        # Export file name နဲ့ timestamp
+        # Export file ဖန်တီး
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_filename = f"cards_export_{timestamp}_{len(rows)}.txt"
+        export_filename = f"{EXPORT_DIR}/cards_export_{timestamp}_{len(rows)}.txt"
         
-        with open(export_filename, 'w') as f:
-            for card, month, year, cvv in rows:
+        card_ids = []
+        with open(export_filename, 'w', encoding='utf-8') as f:
+            for card_id, card, month, year, cvv in rows:
                 line = f"{card}|{month}|{year}|{cvv}"
                 f.write(line + '\n')
+                card_ids.append(card_id)
         
-        print(f"\n📥 Export ပြီးပြီ!")
+        # Database မှာ exported flag ပြင်
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        for cid in card_ids:
+            cursor.execute("UPDATE cards SET exported = 1 WHERE id = ?", (cid,))
+        conn.commit()
+        conn.close()
+        
+        print(f"\n✅ Export Complete!")
         print(f"   📁 File: {export_filename}")
-        print(f"   📊 Total cards: {len(rows)}")
+        print(f"   📊 Cards: {len(rows)}")
         
         return export_filename
     
@@ -149,11 +178,59 @@ def export_cards_to_txt(limit: int = 5000, offset: int = 0):
         return None
 
 
-def auto_export_if_milestone(count: int):
-    """5000/10000/15000 ခုပြည့်တိုင်း auto export"""
-    if count % EXPORT_LIMIT == 0 and count > 0:
-        print(f"\n🎉 Milestone! {count} cards accumulated!")
-        export_cards_to_txt(limit=EXPORT_LIMIT)
+async def send_export_file_to_channel(filename: str):
+    """Export file ကို channel ထဲ ပို့တယ်"""
+    try:
+        if not os.path.exists(filename):
+            print(f"❌ File မရှိ: {filename}")
+            return False
+        
+        # File size ကြည့်
+        file_size = os.path.getsize(filename)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        # File count ရွေ
+        with open(filename, 'r') as f:
+            line_count = len(f.readlines())
+        
+        # Message ဖန်တီး
+        message = f"""
+🎉 **Milestone Alert!** 
+📊 5000 Cards Exported
+
+📁 File: {os.path.basename(filename)}
+📏 Size: {file_size_mb:.2f} MB
+📝 Cards: {line_count}
+⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Format: card|month|year|cvv
+"""
+        
+        # Channel ထဲ file ပို့
+        await client.send_file(
+            entity=MY_CHANNEL,
+            file=filename,
+            caption=message
+        )
+        
+        print(f"✅ File sent to channel: {os.path.basename(filename)}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Send file error: {e}")
+        return False
+
+
+def milestone_reached(current_count: int, previous_count: int) -> bool:
+    """5000 ပြည့်တယ်ဘူး check"""
+    if current_count >= EXPORT_LIMIT and previous_count < EXPORT_LIMIT:
+        return True
+    
+    # 10000, 15000, 20000 etc
+    if current_count % EXPORT_LIMIT == 0 and current_count > 0:
+        return True
+    
+    return False
 
 
 # ============================================
@@ -184,7 +261,6 @@ def save_history():
 
 
 def get_card_number(formatted_line: str) -> str:
-    """Card number ပဲထုတ်"""
     card_number = formatted_line.split('|')[0] if '|' in formatted_line else formatted_line
     card_number = re.sub(r'\D', '', card_number)
     if len(card_number) >= 16:
@@ -193,7 +269,6 @@ def get_card_number(formatted_line: str) -> str:
 
 
 def is_duplicate(formatted_line: str) -> bool:
-    """Duplicate စစ်"""
     if not REMOVE_DUPLICATES:
         return False
     card_number = get_card_number(formatted_line)
@@ -201,7 +276,6 @@ def is_duplicate(formatted_line: str) -> bool:
 
 
 def mark_sent(formatted_line: str):
-    """Sent list ထဲထည့်"""
     if REMOVE_DUPLICATES:
         card_number = get_card_number(formatted_line)
         if card_number:
@@ -209,12 +283,12 @@ def mark_sent(formatted_line: str):
 
 
 # ============================================
-#  Source Channels Resolve
+#  Resolve Source Channels
 # ============================================
 async def resolve_source_channels():
     global source_entities
     
-    print("\n🔍 Source channels/groups ရှာနေတယ်...")
+    print("\n🔍 Source channels ရှာနေတယ်...")
     
     for ch in SOURCE_CHANNELS:
         try:
@@ -238,8 +312,6 @@ async def resolve_source_channels():
 # ============================================
 @client.on(events.NewMessage(chats=SOURCE_CHANNELS))
 async def handler(event):
-    """Source group မှာ message အသစ်တိုင်း"""
-    
     message = event.message
     text = message.text or ""
     
@@ -255,7 +327,7 @@ async def handler(event):
     if message.chat:
         source_title = getattr(message.chat, 'title', str(message.chat.id))
     
-    print(f"\n📩 [{source_title}] — Card info တွေ့တယ်!")
+    print(f"\n📩 [{source_title}]")
     
     lines = cleaned.split('\n')
     sent_count = 0
@@ -267,19 +339,15 @@ async def handler(event):
         if not line:
             continue
         
-        # Year 00 check
         parts = line.split('|')
         if len(parts) >= 3 and parts[2] == '00':
-            print(f"  ⏭️ Skip (year=00): {line}")
             skip_count += 1
             continue
         
-        # Duplicate check
         if is_duplicate(line):
             skip_count += 1
             continue
         
-        # Telegram channel ကို ပို့
         try:
             await client.send_message(
                 entity=MY_CHANNEL,
@@ -289,7 +357,6 @@ async def handler(event):
             
             mark_sent(line)
             
-            # Database ထဲထည့်
             if len(parts) >= 4:
                 card, month, year, cvv = parts[0], parts[1], parts[2], parts[3]
                 insert_card(card, month, year, cvv, source_title)
@@ -302,69 +369,20 @@ async def handler(event):
         except Exception as e:
             print(f"  ❌ Error: {e}")
     
-    # Summary
     db_count_after = get_card_count()
     new_cards = db_count_after - db_count_before
     
-    print(f"📊 Sent: {sent_count} | DB added: {new_cards} | Total DB: {db_count_after}")
+    print(f"📊 Sent: {sent_count} | DB: +{new_cards} | Total: {db_count_after}")
     
-    # Auto export milestone check
-    auto_export_if_milestone(db_count_after)
+    # Milestone check - 5000 ပြည့်ရင် export & send
+    if db_count_after >= EXPORT_LIMIT and get_unexported_count() > 0:
+        print(f"\n🎉 Milestone Reached! {db_count_after} cards!")
+        export_file = export_cards_to_txt()
+        if export_file:
+            await send_export_file_to_channel(export_file)
     
     if sent_count > 0:
         save_history()
-
-
-# ============================================
-#  Backfill
-# ============================================
-async def backfill_source(channel_source, limit=50):
-    entity = await client.get_entity(channel_source)
-    channel_name = getattr(entity, 'title', str(channel_source))
-    
-    print(f"\n🔄 Backfilling {channel_name} (last {limit} messages)...")
-    
-    count = 0
-    async for message in client.iter_messages(entity, limit=limit):
-        text = message.text or ""
-        
-        if not has_card_info(text):
-            continue
-        
-        cleaned = clean_text(text, CLEAN_CONFIG)
-        if not cleaned:
-            continue
-        
-        for line in cleaned.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            
-            if is_duplicate(line):
-                continue
-            
-            try:
-                await client.send_message(
-                    entity=MY_CHANNEL,
-                    message=line,
-                    link_preview=False
-                )
-                mark_sent(line)
-                
-                parts = line.split('|')
-                if len(parts) >= 4:
-                    card, month, year, cvv = parts[0], parts[1], parts[2], parts[3]
-                    insert_card(card, month, year, cvv, channel_name)
-                
-                count += 1
-                print(f"  ✅ {line}")
-                await asyncio.sleep(DELAY_BETWEEN_POSTS)
-            except Exception as e:
-                print(f"  ❌ Error: {e}")
-    
-    print(f"📊 Backfill done: {count} items sent")
-    print(f"📈 Total in DB: {get_card_count()}")
-    save_history()
 
 
 # ============================================
@@ -373,51 +391,11 @@ async def backfill_source(channel_source, limit=50):
 async def main():
     print("=" * 50)
     print("  📡 Telegram Card Forwarder")
-    print("  + Database + Auto Export")
+    print("  Auto Export + Channel Upload")
     print("=" * 50)
     
-    # Initialize database
     init_database()
-    
-    # Load history
     load_history()
     
     current_count = get_card_count()
-    print(f"\n📊 Cards in DB: {current_count}")
-    
-    # Login
-    print("\n🔑 Logging in...")
-    await client.start(phone=PHONE_NUMBER)
-    me = await client.get_me()
-    print(f"🟢 Logged in as: {me.first_name} (@{me.username})")
-    
-    # Resolve source
-    success = await resolve_source_channels()
-    if not success:
-        return
-    
-    # Verify target
-    try:
-        target = await client.get_entity(MY_CHANNEL)
-        target_name = getattr(target, 'title', str(MY_CHANNEL))
-        print(f"🎯 Target channel: {target_name}")
-    except Exception as e:
-        print(f"❌ Target error: {e}")
-        return
-    
-    # Menu
-    print("\n" + "=" * 50)
-    print("  🚀 Options:")
-    print("  1. Real-time forward")
-    print("  2. Backfill old messages")
-    print("  3. Run both")
-    print("  4. Export cards to TXT")
-    print("  5. Check DB stats")
-    print("=" * 50)
-    
-    choice = input("\nChoose (1-5): ").strip()
-    
-    if choice == '4':
-        # Export
-        limit = input("Export limit (default 5000): ").strip()
-        limit = int(limit) if limit.
+    unexported = get_unexported_count()
